@@ -62,6 +62,14 @@ const OTP_MAX_ATTEMPTS    = parseInt(process.env.OTP_MAX_ATTEMPTS)    || 3;
 const OTP_LENGTH          = 6;
 const SESSION_MAX_AGE     = 24 * 60 * 60 * 1000; // 24 hours
 
+const path = require('path');
+app.use(express.static(path.join(__dirname, '../frontend')));
+
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/index.html'));
+});
+
+
 /* ══════════════════════════════════════════════════
    TEMP MAIL DOMAINS BLOCKLIST
 ══════════════════════════════════════════════════ */
