@@ -17,7 +17,8 @@
 /* ══════════════════════════════════════════════════
    CONSTANTS
 ══════════════════════════════════════════════════ */
-const API_BASE = '/api/v1';     // Change to https://yourdomain.com/api/v1
+// Auto-detect API base URL — works on localhost AND Railway/Render/any deploy
+const API_BASE = '/api/v1';
 const OTP_TTL  = 5 * 60;        // 5 minutes in seconds
 const OTP_MAX_ATTEMPTS = 3;     // Max wrong OTP attempts per session
 const RL_MAX_FAILS     = 5;     // Max total failures before lockout
@@ -121,10 +122,11 @@ async function getCSRF() {
   if (_csrfToken) return _csrfToken;
   try {
     const r = await fetch(`${API_BASE}/csrf-token`, { credentials: 'include' });
+    if (!r.ok) return null;
     const d = await r.json();
-    _csrfToken = d.token;
+    _csrfToken = (d.token && d.token !== 'none') ? d.token : null;
     return _csrfToken;
-  } catch { return 'demo-csrf-token'; }   // fallback for demo
+  } catch { return null; }  // CSRF disabled or offline — proceed
 }
 
 /* ══════════════════════════════════════════════════
@@ -137,7 +139,7 @@ async function apiPost(endpoint, body) {
     credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
-      'X-CSRF-Token': csrf,
+      ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
       'X-Requested-With': 'XMLHttpRequest',
     },
     body: JSON.stringify(body),
@@ -228,12 +230,13 @@ function timingSafeEqual(a, b) {
    APP STATE
 ══════════════════════════════════════════════════ */
 const State = {
-  mode:      'email',   // 'email' | 'phone'
-  step:      1,
+  mode:        'email',   // 'email' | 'phone'
+  step:        1,
   captchaDone: false,
-  passHash:  '',
-  passSalt:  '',
-  mouseScore: 0,
+  passHash:    '',
+  passSalt:    '',
+  mouseScore:  0,
+  otpSessionId: null,   // set by server on login/init
 };
 
 // Track human behavior for CAPTCHA
@@ -509,31 +512,71 @@ async function sendOtp() {
     ? contact.slice(0, 3) + '****@' + contact.split('@')[1]
     : contact.slice(0, 5) + '****' + contact.slice(-2);
 
-  // In production — call your backend to send OTP via email/SMS
-  // await apiPost('/auth/otp/send', { contact, mode: State.mode });
+  // Call backend to send OTP
+  try {
+    const contact = State.mode === 'email'
+      ? document.getElementById('eI').value.trim()
+      : document.getElementById('ccode').value + document.getElementById('phI').value.trim();
 
-  document.getElementById('otpDesc').innerHTML =
-    `A verification code was sent to <strong>${masked}</strong>.<br>` +
-    `<span style="color:var(--amber);font-size:12px;font-family:var(--mono)">[DEMO] OTP: ${otpVal} — remove in production</span>`;
+    const res = await apiPost('/auth/login/init', { contact, mode: State.mode, passHash: State.passHash });
 
+    if (!res.ok) {
+      setAlert(res.data?.error || 'Failed to send OTP. Please try again.', 'err');
+      return;
+    }
+
+    // Store sessionId from server
+    State.otpSessionId = res.data.sessionId;
+
+    const demoOtp = res.data._demo_otp;
+    document.getElementById('otpDesc').innerHTML =
+      `A verification code was sent to <strong>${masked}</strong>.<br>` +
+      (demoOtp
+        ? `<span style="color:var(--amber);font-size:12px;font-family:var(--mono)">⚠️ Demo mode — OTP: <strong>${demoOtp}</strong><br>Configure email/SMS to hide this</span>`
+        : `<span style="color:var(--green);font-size:12px">✅ Code sent successfully</span>`);
+  } catch(e) {
+    setAlert('Network error. Check your connection.', 'err');
+    return;
+  }
   startTimer();
 }
 
-function resend() {
-  if (OTP.attempts >= OTP_MAX_ATTEMPTS) {
-    setAlert('Maximum OTP attempts reached. Please start over.', 'err');
-    return;
-  }
-  // Reset OTP cells
+async function resend() {
   for (let i = 0; i < 6; i++) {
     const c = document.getElementById(`o${i}`);
-    c.value     = '';
-    c.className = 'otp-c';
+    c.value = ''; c.className = 'otp-c';
   }
   setHint('otpH', '', '');
-  sendOtp();
-  setTimeout(() => document.getElementById('o0').focus(), 100);
-  setAlert('New code sent!', 'ok');
+  document.getElementById('resendB').disabled = true;
+
+  try {
+    const res = await apiPost('/auth/otp/resend', {});
+    if (res.ok) {
+      const demoOtp = res.data?._demo_otp;
+      State.otpSessionId = res.data?.sessionId || State.otpSessionId;
+
+      const contact = State.mode === 'email'
+        ? document.getElementById('eI').value.trim()
+        : document.getElementById('ccode').value + document.getElementById('phI').value.trim();
+      const masked = State.mode === 'email'
+        ? contact.slice(0,3)+'****@'+contact.split('@')[1]
+        : contact.slice(0,5)+'****'+contact.slice(-2);
+
+      document.getElementById('otpDesc').innerHTML =
+        `A new code was sent to <strong>${masked}</strong>.<br>` +
+        (demoOtp ? `<span style="color:var(--amber);font-size:12px;font-family:var(--mono)">Demo OTP: <strong>${demoOtp}</strong></span>` : '');
+
+      startTimer();
+      setTimeout(() => document.getElementById('o0').focus(), 100);
+      setAlert('New code sent!', 'ok');
+    } else {
+      setAlert(res.data?.error || 'Failed to resend. Try again.', 'err');
+      document.getElementById('resendB').disabled = false;
+    }
+  } catch(e) {
+    setAlert('Network error.', 'err');
+    document.getElementById('resendB').disabled = false;
+  }
 }
 
 /* ══════════════════════════════════════════════════
@@ -670,41 +713,40 @@ async function step2() {
     return;
   }
 
-  const result = OTP.verify(entered);
+  // Call real backend to verify OTP
+  setBtn('b2', 'Verifying…', true);
+  try {
+    const res = await apiPost('/auth/otp/verify', {
+      otp: entered,
+      sessionId: State.otpSessionId,
+    });
 
-  if (result.ok) {
-    clearInterval(_timerInterval);
-    RateLimit.reset();
-    buildSummary();
-    goToStep(3);
-  } else {
-    const locked = RateLimit.recordFail();
-    if (locked) return;
-
-    if (result.reason === 'expired') {
-      setAlert('OTP has expired. Please request a new code.', 'warn');
-      document.getElementById('resendB').disabled = false;
-    } else if (result.reason === 'too-many-attempts') {
-      setAlert(`Maximum OTP attempts reached (${OTP_MAX_ATTEMPTS}). Please request a new code.`, 'err');
-      document.getElementById('resendB').disabled = false;
-    } else if (result.reason === 'already-used') {
-      setAlert('This OTP has already been used. Please request a new code.', 'err');
+    if (res.ok) {
+      clearInterval(_timerInterval);
+      RateLimit.reset();
+      buildSummary();
+      goToStep(3);
     } else {
-      const left = result.attemptsLeft;
-      setAlert(
-        left > 0
-          ? `Incorrect code. ${left} attempt${left === 1 ? '' : 's'} remaining.`
-          : 'No attempts remaining. Please request a new code.',
-        'err'
-      );
-      setHint('otpH', 'Invalid OTP', 'err');
-    }
+      const locked = RateLimit.recordFail();
+      if (locked) return;
 
-    // Shake animation on cells
-    for (let i = 0; i < 6; i++) document.getElementById(`o${i}`).classList.add('bad');
-    setTimeout(() => {
-      for (let i = 0; i < 6; i++) document.getElementById(`o${i}`).classList.remove('bad');
-    }, 400);
+      const errMsg = res.data?.error || 'Incorrect OTP. Please try again.';
+      setAlert(errMsg, 'err');
+      setHint('otpH', 'Invalid OTP', 'err');
+
+      if (res.data?.expired || res.data?.tooManyAttempts) {
+        document.getElementById('resendB').disabled = false;
+      }
+
+      for (let i = 0; i < 6; i++) document.getElementById(`o${i}`).classList.add('bad');
+      setTimeout(() => {
+        for (let i = 0; i < 6; i++) document.getElementById(`o${i}`).classList.remove('bad');
+      }, 400);
+    }
+  } catch(e) {
+    setAlert('Network error. Check your connection and try again.', 'err');
+  } finally {
+    setBtn('b2', 'Verify →', false);
   }
 }
 
